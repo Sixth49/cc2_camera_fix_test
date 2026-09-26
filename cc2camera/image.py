@@ -1,0 +1,2047 @@
+#!/usr/bin/env python3
+"""
+Strict, self-contained recovery builder for the Elegoo Centauri Carbon 2
+stock camera firmware family observed in four independent 8 MiB dumps.
+
+The tool:
+  * validates every invariant firmware byte against fingerprints derived
+    independently from the Discord sample and a second physical camera dump;
+  * accepts only the exact known stock / known-patched system fragment;
+  * extracts and preserves the camera's own serial.cfg from JFFS2;
+  * rebuilds a minimal, CRC-valid 128 KiB JFFS2 config partition;
+  * applies the audited /home/bashrc.sh mitigation;
+  * writes a full recovery image plus a flashrom layout and validation report.
+
+It has no third-party Python dependencies and intentionally has no "force"
+option for unknown firmware.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import date
+import hashlib
+import json
+import lzma
+import re
+import struct
+import sys
+import zipfile
+import zlib
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+from .display import invocation
+from .bundle import staged_directory
+
+from . import __version__ as TOOL_VERSION
+MIN_IDENTICAL_READS = 3
+MAX_USB_READ_ATTEMPTS = 5
+
+FLASH_SIZE = 0x800000
+PATCH_START = 0x463000
+PATCH_END = 0x46B000
+PATCH_SIZE = PATCH_END - PATCH_START
+CONFIG_START = 0x7E0000
+CONFIG_END = 0x800000
+CONFIG_SIZE = CONFIG_END - CONFIG_START
+
+# Stable on-disk schema identifier, independent of the CLI/package name.
+USB_BACKUP_FORMAT = "cc2flash-backup-v2"
+USB_BACKUP_IMAGE_MEMBER = "flash.bin"
+USB_BACKUP_MANIFEST_MEMBER = "manifest.json"
+USB_BACKUP_MEMBERS = frozenset(
+    (USB_BACKUP_IMAGE_MEMBER, USB_BACKUP_MANIFEST_MEMBER)
+)
+MAX_USB_MANIFEST_SIZE = 1024 * 1024
+KNOWN_BOOTLOADER_SHA256 = (
+    "5602ec961b4410ccceea0d4910e4fa768c6998bd4ba86143ba50855bdd0b7a54"
+)
+EXPECTED_USB_PARTITIONS = (
+    (0, 0x040000, "boot"),
+    (1, 0x150000, "kernel"),
+    (2, 0x158000, "root"),
+    (3, 0x4E8000, "system"),
+    (4, 0x010000, "hwconfig"),
+    (5, 0x020000, "config"),
+)
+
+# The HWCONFIG type-12 record contains a unit-specific three-byte check value,
+# a 94-byte encrypted/encoded UOID, and a four-byte little-endian calendar date
+# in its known 256-byte prefix. Some cameras append opaque bytes to that
+# payload. The record length bounds those bytes; recovery preserves all of
+# these unit-specific values exactly but normalizes them for invariant hashing.
+HW_RECORD_START = 0x7D2000
+HW_RECORD_PAYLOAD_START = HW_RECORD_START + 4
+HW_KNOWN_PAYLOAD_END = HW_RECORD_PAYLOAD_START + 0x100
+HW_SUPPORTED_PAYLOAD_LENGTHS = (0x100, 0x105)
+HW_CHECK_START = 0x7D200A
+HW_CHECK_END = 0x7D200D
+HW_UOID_START = 0x7D2011
+HW_UOID_END = 0x7D206F
+HW_DATE_START = HW_UOID_END
+HW_DATE_END = 0x7D2073
+HW_SUPPORTED_DATES = frozenset((date(2026, 3, 2), date(2026, 4, 1)))
+
+JFFS2_MAGIC = 0x1985
+JFFS2_NODE_ACCURATE = 0x2000
+JFFS2_DIRENT = 0x0001
+JFFS2_INODE = 0x0002
+JFFS2_CLEANMARKER = 0x0003
+
+KNOWN_CONFIG_NAMES = {
+    b"serial.cfg",
+    b"uvc.attr",
+    b"uvc2.attr",
+    b"uvc.config",
+    b"uvc_dualstream.config",
+    b"dev_config.cfg",
+}
+
+SERIAL_PATTERN = re.compile(rb"^serial=(12PSSSS[3-9][A-Z0-9]{28})\n$")
+UOID_PATTERN = re.compile(rb"^12PSSSS[3-9][A-Za-z0-9+/=]{86}$")
+
+# Exact byte ranges shared by every supported HWCONFIG variant.
+REFERENCE_SEGMENTS = {
+    "boot": (0x000000, 0x040000, "5602ec961b4410ccceea0d4910e4fa768c6998bd4ba86143ba50855bdd0b7a54"),
+    "kernel": (0x040000, 0x190000, "0855c3a93f571c3130f1bdd38469e7c806ce713550a3ce536c81167579341545"),
+    "root": (0x190000, 0x2E8000, "6049eaacfaba6a2c3db2ed7a5f31cd02df8d793e166249f6a8a2180e89824cba"),
+    "system_before_patch": (0x2E8000, 0x463000, "0e76c9eb0dfb499c7556a6a111608757b6c9e32705c07492f172253255fe8041"),
+    "system_after_patch": (0x46B000, 0x7D0000, "07a3b00fe224a8e121f760753998335e7f6d59f1cfe2dc92087c040083f46b3a"),
+    "hwconfig_between_identity_fields": (0x7D200D, 0x7D2011, "3c3351dc1dedcd627419e02de4fc8202e2d507d786c26f142b767fd9859d0cb4"),
+}
+
+# These hashes use the type-12 record's canonical 256-byte payload length,
+# exclude the structurally validated unit fields, and use zero bytes in place
+# of any declared extension. This retains exact checking of every other byte
+# without treating unit data or an unknown opaque extension as firmware.
+HWCONFIG_BEFORE_IDENTITY_SHA256 = (
+    "e9ba6b36ab55dd0284e7cfcaf8c6ece3b4903bf953dcae34026244a5febd701d"
+)
+HWCONFIG_AFTER_UNIT_FIELDS_SHA256 = (
+    "f2e10823638187acb4572437debe618bb1c27d0a8796d40445c3132cdd805601"
+)
+NORMALIZED_INVARIANT_SHA256 = (
+    "4dee29ee9f996779a8af0f4e4a66ebad3c6c1ca353cf8b4287b4f1f9a8b12823"
+)
+
+ORIGINAL_PATCH_SHA256 = "5591f5350feabb73fd29e21ae72ee9c3c9dab0c6bb78e02178267e5cb2ab4780"
+PATCHED_PATCH_SHA256 = "36e9b9b29dffcd775b094ff67a121fbb78b1871a7eda059371cbafc562251b2b"
+ORIGINAL_BASHRC_SHA256 = "984e1d34fb69bd83d43335e62911503461b389f96f86c5c837f7aab57a48417d"
+PATCHED_BASHRC_SHA256 = "eab95c4ef39ba900fdd87684feee916f36e2901d3a7abe3fe65d2cde459e0f88"
+
+# The stock SquashFS has one 100167-byte fragment. bashrc.sh occupies a
+# same-length slice within it. These offsets and hashes are verified before
+# anything is modified, and the final 32 KiB window must match its known hash.
+SQUASHFS_FRAGMENT_START = 0x463600
+SQUASHFS_FRAGMENT_SIZE_FIELD = 0x46A11A
+ORIGINAL_FRAGMENT_XZ_SIZE = 26268
+PATCHED_FRAGMENT_XZ_SIZE = 25564
+FRAGMENT_UNCOMPRESSED_SIZE = 100167
+BASHRC_FRAGMENT_OFFSET = 29000
+LZMA2_DICT_SIZE = 131072
+ORIGINAL_FRAGMENT_XZ_SHA256 = "4c6d2cf7ce219721a8f027056c207d05fb01e1ae2165bf17e5208f37d690869f"
+PATCHED_FRAGMENT_XZ_SHA256 = "ca9162b4b6b7a898901be0503d5c4cb10e94f01c44e79caf4f7c3a5172e768f5"
+ORIGINAL_FRAGMENT_SHA256 = "322825a20f30d04d5ad6fc2f677cd8fce2b0c43189d802d1fbb05d2049c07329"
+PATCHED_FRAGMENT_SHA256 = "a6a65889a5d79a8b8935cbf1602c1a152a52c2d28f66821f0a5adaac9546c905"
+
+# This is the complete human-readable source transformation. The replacement
+# is padded on its last line so bashrc.sh remains exactly 5699 bytes.
+ORIGINAL_COPY_BLOCK = b"""# [ ! -f /etc/conf.d/uvc.attr ] && cp /system/config/uvc.attr /etc/conf.d/uvc.attr
+# [ ! -f /etc/conf.d/uvc.config ] && cp /system/config/uvc.config /etc/conf.d/uvc.config
+# [ ! -f /etc/conf.d/dev_config.cfg ] && cp /system/config/dev_config.cfg /etc/conf.d/dev_config.cfg
+cp /system/config/uvc.attr /etc/conf.d/uvc.attr
+cp /system/config/uvc2.attr /etc/conf.d/uvc2.attr
+cp /system/config/uvc_dualstream.config /etc/conf.d/uvc.config
+cp /system/config/uvc_dualstream.config /etc/conf.d/uvc_dualstream.config
+cp /system/config/dev_config.cfg /etc/conf.d/dev_config.cfg
+
+# [ ! -f /etc/conf.d/uvc2.attr ] && cp /system/config/uvc2.attr /etc/conf.d/uvc2.attr
+# [ ! -f /etc/conf.d/uvc_dualstream.config ] && cp /system/config/uvc_dualstream.config /etc/conf.d/uvc_dualstream.config
+
+"""
+
+PATCHED_COPY_BLOCK_VISIBLE = b"""# Copy defaults only when absent.  The original unconditional copies
+# consume JFFS2 space on every boot, while this firmware cannot reclaim it.
+[ -f /etc/conf.d/uvc.attr ] || cp /system/config/uvc.attr /etc/conf.d/uvc.attr
+[ -f /etc/conf.d/uvc2.attr ] || cp /system/config/uvc2.attr /etc/conf.d/uvc2.attr
+[ -f /etc/conf.d/uvc.config ] || cp /system/config/uvc_dualstream.config /etc/conf.d/uvc.config
+[ -f /etc/conf.d/uvc_dualstream.config ] || cp /system/config/uvc_dualstream.config /etc/conf.d/uvc_dualstream.config
+[ -f /etc/conf.d/dev_config.cfg ] || cp /system/config/dev_config.cfg /etc/conf.d/dev_config.cfg
+
+# SquashFS in-place patch padding; keep bashrc.sh length unchanged.
+"""
+
+OUTPUT_FILE_NAMES = {
+    "cc2-camera-recovery.bin",
+    "cc2-camera-layout.txt",
+    "config-restored.bin",
+    "serial.cfg",
+    "MANIFEST.json",
+    "VALIDATION.txt",
+    "FLASHING.txt",
+    "SHA256SUMS.txt",
+}
+
+class ValidationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class ConfigFile:
+    name: bytes
+    data: bytes
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    atime: int
+    mtime: int
+    ctime: int
+    flags: int
+    dirent_mctime: int
+    dtype: int
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def image_hashes(data: bytes) -> dict[str, str | int]:
+    return {
+        "size": len(data),
+        "sha256": sha256(data),
+        "md5": hashlib.md5(data).hexdigest(),
+    }
+
+
+def _validate_usb_backup_manifest(manifest: Any, image: bytes) -> dict[str, Any]:
+    """Validate acquisition evidence produced by cc2camera."""
+
+    if not isinstance(manifest, dict):
+        raise ValidationError("USB backup manifest must be a JSON object")
+    if manifest.get("format") != USB_BACKUP_FORMAT:
+        raise ValidationError(
+            "USB backup requires a cc2flash-backup-v2 manifest with three "
+            "identical reads"
+        )
+
+    actual_hashes = image_hashes(image)
+    for key, expected in actual_hashes.items():
+        if manifest.get(key) != expected:
+            raise ValidationError(
+                f"USB backup manifest {key} does not match flash.bin"
+            )
+
+    boot_hash = sha256(image[:0x040000])
+    expected_bootloader = {
+        "partition": "boot",
+        "size": 0x040000,
+        "sha256": boot_hash,
+        "known_sha256": KNOWN_BOOTLOADER_SHA256,
+        "known_reference": boot_hash == KNOWN_BOOTLOADER_SHA256,
+    }
+    bootloader = manifest.get("bootloader")
+    if not isinstance(bootloader, dict):
+        raise ValidationError("USB backup manifest has no bootloader fingerprint")
+    for key, expected in expected_bootloader.items():
+        if bootloader.get(key) != expected:
+            raise ValidationError(
+                f"USB backup manifest bootloader {key} does not match flash.bin"
+            )
+    acceptance = bootloader.get("acceptance")
+    expected_acceptance = (
+        "known-reference"
+        if expected_bootloader["known_reference"]
+        else "explicit-hash"
+    )
+    if acceptance != expected_acceptance:
+        raise ValidationError(
+            "USB backup manifest does not contain the required bootloader "
+            "hash acceptance"
+        )
+
+    if manifest.get("required_identical_reads") != MIN_IDENTICAL_READS:
+        raise ValidationError("USB backup does not require three identical reads")
+    consecutive = manifest.get("consecutive_identical_reads")
+    if type(consecutive) is not int or consecutive != MIN_IDENTICAL_READS:
+        raise ValidationError(
+            "USB backup lacks three consecutive identical physical reads"
+        )
+    read_passes = manifest.get("read_passes")
+    if type(read_passes) is not int or not (
+        MIN_IDENTICAL_READS <= read_passes <= MAX_USB_READ_ATTEMPTS
+    ):
+        raise ValidationError("USB backup has an invalid physical-read count")
+    if manifest.get("maximum_read_attempts") != MAX_USB_READ_ATTEMPTS:
+        raise ValidationError("USB backup has an unexpected read-attempt policy")
+
+    partitions = manifest.get("partitions")
+    if not isinstance(partitions, list) or len(partitions) != len(
+        EXPECTED_USB_PARTITIONS
+    ):
+        raise ValidationError("USB backup manifest has an invalid partition map")
+    for item, (index, size, name) in zip(
+        partitions, EXPECTED_USB_PARTITIONS
+    ):
+        if (
+            not isinstance(item, dict)
+            or item.get("index") != index
+            or item.get("size") != size
+            or not isinstance(item.get("name"), str)
+            or item["name"].casefold() != name
+        ):
+            raise ValidationError("USB backup manifest has an invalid partition map")
+
+    return {
+        "format": USB_BACKUP_FORMAT,
+        "image_member": USB_BACKUP_IMAGE_MEMBER,
+        "read_passes": read_passes,
+        "required_identical_reads": MIN_IDENTICAL_READS,
+        "consecutive_identical_reads": consecutive,
+        "maximum_read_attempts": MAX_USB_READ_ATTEMPTS,
+        "bootloader_acceptance": acceptance,
+        **actual_hashes,
+    }
+
+
+def read_image_source(path: Path) -> tuple[bytes, dict[str, Any]]:
+    """Read a raw dump or a strict cc2camera backup ZIP without extracting it."""
+
+    if path.suffix.casefold() != ".zip":
+        image = path.read_bytes()
+        return image, {
+            "format": "raw-flash-image",
+            "image_member": None,
+            "evidenced_identical_reads": 1,
+            **image_hashes(image),
+        }
+
+    try:
+        with zipfile.ZipFile(path, mode="r") as archive:
+            infos = archive.infolist()
+            names = [item.filename for item in infos]
+            if len(names) != 2 or set(names) != USB_BACKUP_MEMBERS:
+                raise ValidationError(
+                    "USB backup ZIP must contain exactly flash.bin and manifest.json"
+                )
+            by_name = {item.filename: item for item in infos}
+            if any(item.flag_bits & 0x1 for item in infos):
+                raise ValidationError("USB backup ZIP must not be encrypted")
+            if by_name[USB_BACKUP_IMAGE_MEMBER].file_size != FLASH_SIZE:
+                raise ValidationError("USB backup flash.bin is not exactly 8 MiB")
+            if (
+                by_name[USB_BACKUP_MANIFEST_MEMBER].file_size
+                > MAX_USB_MANIFEST_SIZE
+            ):
+                raise ValidationError("USB backup manifest is unexpectedly large")
+            image = archive.read(USB_BACKUP_IMAGE_MEMBER)
+            manifest_bytes = archive.read(USB_BACKUP_MANIFEST_MEMBER)
+    except ValidationError:
+        raise
+    except (
+        OSError,
+        RuntimeError,
+        NotImplementedError,
+        zipfile.BadZipFile,
+        zlib.error,
+        lzma.LZMAError,
+    ) as exc:
+        raise ValidationError("USB backup ZIP is unreadable or corrupt") from exc
+
+    if len(image) != FLASH_SIZE:
+        raise ValidationError("USB backup flash.bin is not exactly 8 MiB")
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise ValidationError("USB backup manifest is unreadable") from exc
+    evidence = _validate_usb_backup_manifest(manifest, image)
+    evidence["evidenced_identical_reads"] = MIN_IDENTICAL_READS
+    return image, evidence
+
+
+def jffs2_crc(data: bytes) -> int:
+    return (zlib.crc32(data, 0xFFFFFFFF) ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+
+def align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
+def mask_value(value: bytes, head: int = 12, tail: int = 7) -> str:
+    text = value.decode("ascii", errors="replace")
+    if len(text) <= head + tail + 1:
+        return text
+    return f"{text[:head]}…{text[-tail:]}"
+
+
+def xz_vli(value: int) -> bytes:
+    """Encode an XZ variable-length integer."""
+    if value < 0:
+        raise ValueError("XZ VLI values cannot be negative")
+    encoded = bytearray()
+    while True:
+        remaining = value >> 7
+        encoded.append((value & 0x7F) | (0x80 if remaining else 0))
+        if not remaining:
+            return bytes(encoded)
+        value = remaining
+
+
+def build_squashfs_xz_fragment(data: bytes) -> bytes:
+    """Build the single-block XZ stream format emitted by mksquashfs here."""
+    compressed = lzma.compress(
+        data,
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_LZMA2, "dict_size": LZMA2_DICT_SIZE}],
+    )
+
+    # XZ stream header: magic, CRC32 check type, and CRC of the two flags.
+    stream_flags = b"\x00\x01"
+    stream_header = (
+        b"\xFD7zXZ\x00"
+        + stream_flags
+        + struct.pack("<I", zlib.crc32(stream_flags) & 0xFFFFFFFF)
+    )
+
+    # SquashFS requests both compressed and uncompressed sizes in the XZ
+    # block header. The only filter is LZMA2 (0x21), property 0x0A = 128 KiB.
+    block_header = bytearray(b"\x00\xC0")
+    block_header += xz_vli(len(compressed))
+    block_header += xz_vli(len(data))
+    block_header += b"\x21\x01\x0A"
+    block_header += b"\x00" * (-(len(block_header) + 4) % 4)
+    block_header[0] = (len(block_header) + 4) // 4 - 1
+    block_header += struct.pack(
+        "<I", zlib.crc32(block_header) & 0xFFFFFFFF
+    )
+
+    block = bytes(block_header) + compressed
+    block += b"\x00" * (-len(compressed) % 4)
+    block += struct.pack("<I", zlib.crc32(data) & 0xFFFFFFFF)
+
+    unpadded_size = len(block_header) + len(compressed) + 4
+    index = bytearray(b"\x00\x01")
+    index += xz_vli(unpadded_size) + xz_vli(len(data))
+    index += b"\x00" * (-len(index) % 4)
+    index += struct.pack("<I", zlib.crc32(index) & 0xFFFFFFFF)
+
+    footer_fields = struct.pack("<I", len(index) // 4 - 1) + stream_flags
+    footer = (
+        struct.pack("<I", zlib.crc32(footer_fields) & 0xFFFFFFFF)
+        + footer_fields
+        + b"YZ"
+    )
+    return stream_header + block + bytes(index) + footer
+
+
+def patch_bashrc(original: bytes) -> bytes:
+    """Apply the complete readable shell-source change, preserving length."""
+    if sha256(original) != ORIGINAL_BASHRC_SHA256:
+        raise ValidationError("Extracted bashrc.sh failed its stock SHA-256 check")
+    if original.count(ORIGINAL_COPY_BLOCK) != 1:
+        raise ValidationError("Stock bashrc.sh does not contain one exact copy block")
+
+    padding = len(ORIGINAL_COPY_BLOCK) - len(PATCHED_COPY_BLOCK_VISIBLE)
+    if padding < 0:
+        raise ValidationError("Internal bashrc replacement is too large")
+    replacement = (
+        PATCHED_COPY_BLOCK_VISIBLE[:-1] + b" " * padding + b"\n"
+    )
+    patched = original.replace(ORIGINAL_COPY_BLOCK, replacement)
+    if len(patched) != len(original):
+        raise ValidationError("Internal bashrc patch changed the script length")
+    if sha256(patched) != PATCHED_BASHRC_SHA256:
+        raise ValidationError("Generated bashrc.sh failed its patched SHA-256 check")
+    return patched
+
+
+def build_system_patch_window(image: bytes) -> bytes:
+    """Rebuild the audited SquashFS fragment without an opaque binary delta."""
+    stock_window = image[PATCH_START:PATCH_END]
+    if sha256(stock_window) != ORIGINAL_PATCH_SHA256:
+        raise ValidationError("Refusing to patch a non-stock system window")
+
+    original_xz = image[
+        SQUASHFS_FRAGMENT_START:
+        SQUASHFS_FRAGMENT_START + ORIGINAL_FRAGMENT_XZ_SIZE
+    ]
+    if sha256(original_xz) != ORIGINAL_FRAGMENT_XZ_SHA256:
+        raise ValidationError("Stock SquashFS fragment failed its SHA-256 check")
+    try:
+        fragment = lzma.decompress(original_xz, format=lzma.FORMAT_XZ)
+    except lzma.LZMAError as exc:
+        raise ValidationError(f"Stock SquashFS fragment failed to decompress: {exc}") from exc
+    if (
+        len(fragment) != FRAGMENT_UNCOMPRESSED_SIZE
+        or sha256(fragment) != ORIGINAL_FRAGMENT_SHA256
+    ):
+        raise ValidationError("Stock SquashFS fragment content is not the audited version")
+
+    bashrc_end = BASHRC_FRAGMENT_OFFSET + 5699
+    original_bashrc = fragment[BASHRC_FRAGMENT_OFFSET:bashrc_end]
+    patched_bashrc = patch_bashrc(original_bashrc)
+    patched_fragment = (
+        fragment[:BASHRC_FRAGMENT_OFFSET]
+        + patched_bashrc
+        + fragment[bashrc_end:]
+    )
+    if sha256(patched_fragment) != PATCHED_FRAGMENT_SHA256:
+        raise ValidationError("Patched SquashFS fragment failed its content hash")
+
+    patched_xz = build_squashfs_xz_fragment(patched_fragment)
+    if (
+        len(patched_xz) != PATCHED_FRAGMENT_XZ_SIZE
+        or sha256(patched_xz) != PATCHED_FRAGMENT_XZ_SHA256
+    ):
+        raise ValidationError(
+            "Deterministic XZ output differs from the audited patched fragment; "
+            "check the Python/liblzma implementation"
+        )
+
+    patched_window = bytearray(stock_window)
+    fragment_relative = SQUASHFS_FRAGMENT_START - PATCH_START
+    patched_window[
+        fragment_relative:fragment_relative + len(patched_xz)
+    ] = patched_xz
+    # The shorter stream intentionally leaves the old trailing bytes untouched;
+    # SquashFS ignores them after this authoritative size field is updated.
+    size_relative = SQUASHFS_FRAGMENT_SIZE_FIELD - PATCH_START
+    struct.pack_into("<I", patched_window, size_relative, len(patched_xz))
+
+    result = bytes(patched_window)
+    if sha256(result) != PATCHED_PATCH_SHA256:
+        raise ValidationError("Generated system window failed its audited SHA-256")
+    return result
+
+
+def restored_accurate_slice(raw: bytes, node_type: int, obsolete: bool) -> bytes:
+    if not obsolete:
+        return raw
+    fixed = bytearray(raw)
+    struct.pack_into("<H", fixed, 2, node_type | JFFS2_NODE_ACCURATE)
+    return bytes(fixed)
+
+
+def parse_jffs2(data: bytes) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+
+    for offset in range(0, len(data) - 11, 4):
+        magic, node_type = struct.unpack_from("<HH", data, offset)
+        if magic != JFFS2_MAGIC:
+            continue
+
+        total_length, stored_header_crc = struct.unpack_from("<II", data, offset + 4)
+        if total_length < 12 or offset + total_length > len(data):
+            continue
+
+        header = data[offset : offset + 8]
+        current = jffs2_crc(header) == stored_header_crc
+        obsolete = False
+
+        if not current and not (node_type & JFFS2_NODE_ACCURATE):
+            fixed_header = bytearray(header)
+            struct.pack_into("<H", fixed_header, 2, node_type | JFFS2_NODE_ACCURATE)
+            obsolete = jffs2_crc(bytes(fixed_header)) == stored_header_crc
+
+        if not (current or obsolete):
+            continue
+
+        base_type = node_type & 0x0FFF
+        node: dict[str, Any] = {
+            "offset": offset,
+            "node_type": node_type,
+            "total_length": total_length,
+            "current": current,
+            "obsolete": obsolete,
+        }
+
+        if base_type == JFFS2_DIRENT and total_length >= 40:
+            parent_inode, version, inode, mctime = struct.unpack_from(
+                "<IIII", data, offset + 12
+            )
+            name_size = data[offset + 28]
+            dtype = data[offset + 29]
+            stored_node_crc, stored_name_crc = struct.unpack_from(
+                "<II", data, offset + 32
+            )
+            name = data[offset + 40 : offset + 40 + name_size]
+
+            node_crc_bytes = restored_accurate_slice(
+                data[offset : offset + 32], node_type, obsolete
+            )
+            if jffs2_crc(node_crc_bytes) != stored_node_crc:
+                continue
+            if jffs2_crc(name) != stored_name_crc:
+                continue
+
+            node.update(
+                kind="dirent",
+                parent_inode=parent_inode,
+                version=version,
+                inode=inode,
+                mctime=mctime,
+                dtype=dtype,
+                name=name,
+            )
+
+        elif base_type == JFFS2_INODE and total_length >= 68:
+            values = struct.unpack_from("<IIIHHIIIIIIIBBHII", data, offset + 12)
+            (
+                inode,
+                version,
+                mode,
+                uid,
+                gid,
+                file_size,
+                atime,
+                mtime,
+                ctime,
+                file_offset,
+                compressed_size,
+                decompressed_size,
+                compression,
+                user_compression,
+                flags,
+                stored_data_crc,
+                stored_node_crc,
+            ) = values
+
+            payload = data[
+                offset + 68 : offset + 68 + compressed_size
+            ]
+            node_crc_bytes = restored_accurate_slice(
+                data[offset : offset + 60], node_type, obsolete
+            )
+            if jffs2_crc(node_crc_bytes) != stored_node_crc:
+                continue
+            if jffs2_crc(payload) != stored_data_crc:
+                continue
+
+            node.update(
+                kind="inode",
+                inode=inode,
+                version=version,
+                mode=mode,
+                uid=uid,
+                gid=gid,
+                file_size=file_size,
+                atime=atime,
+                mtime=mtime,
+                ctime=ctime,
+                file_offset=file_offset,
+                compressed_size=compressed_size,
+                decompressed_size=decompressed_size,
+                compression=compression,
+                user_compression=user_compression,
+                flags=flags,
+                payload=payload,
+            )
+
+        elif base_type == JFFS2_CLEANMARKER:
+            node.update(kind="cleanmarker")
+
+        else:
+            node.update(kind=f"other_0x{base_type:03x}")
+
+        nodes.append(node)
+
+    return nodes
+
+
+def serial_payload_is_valid(payload: bytes) -> bool:
+    return SERIAL_PATTERN.fullmatch(payload) is not None
+
+
+def decode_jffs2_fragment(node: dict[str, Any], name: bytes) -> bytes:
+    compression = node["compression"]
+    decompressed_size = node["decompressed_size"]
+    if decompressed_size > CONFIG_SIZE:
+        raise ValidationError(
+            f"Live config file {name!r} has a fragment larger than the config "
+            "partition"
+        )
+    if compression == 0:
+        data = node["payload"]
+    elif compression == 1:
+        if node["compressed_size"] != 0:
+            raise ValidationError(
+                f"Live config file {name!r} has malformed zero compression"
+            )
+        data = b"\0" * decompressed_size
+    elif compression == 6:
+        try:
+            decompressor = zlib.decompressobj()
+            # The one-byte margin detects a stream that expands beyond its
+            # declared size without ever allowing more than CONFIG_SIZE + 1
+            # output bytes to be allocated.
+            data = decompressor.decompress(
+                node["payload"], decompressed_size + 1
+            )
+        except zlib.error as exc:
+            raise ValidationError(
+                f"Live config file {name!r} has invalid JFFS2 zlib data"
+            ) from exc
+        if len(data) != decompressed_size:
+            raise ValidationError(
+                f"Live config file {name!r} has a decompressed-size mismatch"
+            )
+        if (
+            not decompressor.eof
+            or decompressor.unconsumed_tail
+            or decompressor.unused_data
+        ):
+            raise ValidationError(
+                f"Live config file {name!r} has invalid JFFS2 zlib data"
+            )
+    else:
+        raise ValidationError(
+            f"Live config file {name!r} uses unsupported JFFS2 compression "
+            f"{compression}"
+        )
+    if len(data) != decompressed_size:
+        raise ValidationError(
+            f"Live config file {name!r} has a decompressed-size mismatch"
+        )
+    return data
+
+
+def reconstruct_live_config_files(
+    nodes: list[dict[str, Any]],
+    current_dirents: dict[tuple[int, bytes], dict[str, Any]],
+) -> list[ConfigFile]:
+    nonroot = [
+        node
+        for (parent, _name), node in current_dirents.items()
+        if parent != 1 and node["inode"] != 0
+    ]
+    if nonroot:
+        raise ValidationError(
+            "Preserve-data mode does not support live config subdirectories"
+        )
+
+    files: list[ConfigFile] = []
+    seen_inodes: set[int] = set()
+    live_root = sorted(
+        (
+            (name, node)
+            for (parent, name), node in current_dirents.items()
+            if parent == 1 and node["inode"] != 0
+        ),
+        key=lambda item: item[0],
+    )
+    for name, dirent in live_root:
+        if (
+            not name
+            or len(name) > 255
+            or b"/" in name
+            or b"\0" in name
+            or dirent["dtype"] != 8
+        ):
+            raise ValidationError(
+                f"Preserve-data mode cannot safely recreate config entry {name!r}"
+            )
+        inode_number = dirent["inode"]
+        if inode_number <= 1:
+            raise ValidationError(
+                f"Live config file {name!r} has an invalid inode number"
+            )
+        if inode_number in seen_inodes:
+            raise ValidationError(
+                "Preserve-data mode found multiple live names for one inode"
+            )
+        seen_inodes.add(inode_number)
+        fragments = [
+            node
+            for node in nodes
+            if node.get("kind") == "inode"
+            and node["current"]
+            and node["inode"] == inode_number
+        ]
+        if not fragments:
+            raise ValidationError(
+                f"Live config file {name!r} has no CRC-valid current inode"
+            )
+        fragments.sort(key=lambda item: item["version"])
+        newest_version = fragments[-1]["version"]
+        newest = [
+            node for node in fragments if node["version"] == newest_version
+        ]
+        if len(newest) != 1:
+            raise ValidationError(
+                f"Live config file {name!r} has ambiguous newest metadata"
+            )
+        metadata = newest[0]
+        if metadata["mode"] & 0xF000 != 0x8000:
+            raise ValidationError(
+                f"Preserve-data mode supports only regular files, not {name!r}"
+            )
+        file_size = metadata["file_size"]
+        if file_size < 0 or file_size > CONFIG_SIZE:
+            raise ValidationError(
+                f"Live config file {name!r} has an impossible size"
+            )
+        data = bytearray(file_size)
+        for fragment in fragments:
+            decoded = decode_jffs2_fragment(fragment, name)
+            start = fragment["file_offset"]
+            if start < 0:
+                raise ValidationError(
+                    f"Live config file {name!r} has a negative file offset"
+                )
+            if start >= file_size or not decoded:
+                continue
+            end = min(start + len(decoded), file_size)
+            data[start:end] = decoded[: end - start]
+        files.append(
+            ConfigFile(
+                name=name,
+                data=bytes(data),
+                inode=inode_number,
+                mode=metadata["mode"],
+                uid=metadata["uid"],
+                gid=metadata["gid"],
+                atime=metadata["atime"],
+                mtime=metadata["mtime"],
+                ctime=metadata["ctime"],
+                flags=metadata["flags"],
+                dirent_mctime=dirent["mctime"],
+                dtype=dirent["dtype"],
+            )
+        )
+    return files
+
+
+def extract_serial_and_config_info(
+    config: bytes,
+    *,
+    allow_unknown_names: bool = False,
+    preserve_live_files: bool = False,
+) -> dict[str, Any]:
+    nodes = parse_jffs2(config)
+    if not nodes:
+        raise ValidationError("No CRC-valid JFFS2 nodes were found in config")
+
+    valid_dirents = [n for n in nodes if n.get("kind") == "dirent"]
+    all_names = {n["name"] for n in valid_dirents}
+    unexpected_names = sorted(all_names - KNOWN_CONFIG_NAMES)
+    if unexpected_names and not allow_unknown_names:
+        printable = ", ".join(repr(name) for name in unexpected_names)
+        raise ValidationError(
+            "Config contains unexpected CRC-valid names that this tool will not "
+            f"discard automatically: {printable}"
+        )
+
+    current_dirents: dict[tuple[int, bytes], dict[str, Any]] = {}
+    for node in valid_dirents:
+        if not node["current"]:
+            continue
+        key = (node["parent_inode"], node["name"])
+        previous = current_dirents.get(key)
+        if previous is not None and node["version"] == previous["version"]:
+            raise ValidationError(
+                f"Config has ambiguous current directory entries for {node['name']!r}"
+            )
+        if previous is None or node["version"] > previous["version"]:
+            current_dirents[key] = node
+
+    live_entries = {
+        name: node
+        for (parent, name), node in current_dirents.items()
+        if parent == 1 and node["inode"] != 0
+    }
+
+    serial_source = "live-current"
+    serial_payload: bytes | None = None
+
+    serial_dirent = live_entries.get(b"serial.cfg")
+    if serial_dirent is not None:
+        inode_candidates = [
+            n
+            for n in nodes
+            if n.get("kind") == "inode"
+            and n["current"]
+            and n["inode"] == serial_dirent["inode"]
+            and n["file_offset"] == 0
+            and n["compression"] == 0
+            and n["compressed_size"] == n["decompressed_size"]
+            and n["file_size"] == n["decompressed_size"]
+            and serial_payload_is_valid(n["payload"])
+        ]
+        if inode_candidates:
+            inode_candidates.sort(key=lambda item: item["version"], reverse=True)
+            newest_version = inode_candidates[0]["version"]
+            newest = [
+                item for item in inode_candidates if item["version"] == newest_version
+            ]
+            if len(newest) != 1:
+                raise ValidationError(
+                    "Multiple equally current serial.cfg inode candidates were found"
+                )
+            serial_payload = newest[0]["payload"]
+
+    if serial_payload is None:
+        # Conservative fallback for a damaged live directory entry: accept a
+        # historical serial only if every CRC-valid serial-looking inode agrees.
+        historical = {
+            n["payload"]
+            for n in nodes
+            if n.get("kind") == "inode"
+            and n["file_offset"] == 0
+            and n["compression"] == 0
+            and n["compressed_size"] == n["decompressed_size"]
+            and n["file_size"] == n["decompressed_size"]
+            and serial_payload_is_valid(n["payload"])
+        }
+        if len(historical) != 1:
+            raise ValidationError(
+                "Could not recover exactly one unambiguous CRC-valid serial.cfg "
+                f"payload (found {len(historical)})"
+            )
+        serial_payload = next(iter(historical))
+        serial_source = "unique-historical-fallback"
+
+    serial_match = SERIAL_PATTERN.fullmatch(serial_payload)
+    assert serial_match is not None
+    serial_value = serial_match.group(1)
+
+    live_config_files: list[ConfigFile] | None = None
+    if preserve_live_files:
+        live_config_files = reconstruct_live_config_files(
+            nodes, current_dirents
+        )
+        by_name = {item.name: item for item in live_config_files}
+        live_serial = by_name.get(b"serial.cfg")
+        if live_serial is None:
+            used_inodes = {item.inode for item in live_config_files}
+            serial_inode = next(
+                inode for inode in range(2, 0xFFFFFFFF) if inode not in used_inodes
+            )
+            live_config_files.append(
+                ConfigFile(
+                    name=b"serial.cfg",
+                    data=serial_payload,
+                    inode=serial_inode,
+                    mode=0x81A4,
+                    uid=0,
+                    gid=0,
+                    atime=18,
+                    mtime=18,
+                    ctime=18,
+                    flags=0,
+                    dirent_mctime=1,
+                    dtype=8,
+                )
+            )
+            live_config_files.sort(key=lambda item: item.name)
+        elif live_serial.data != serial_payload:
+            raise ValidationError(
+                "Live serial.cfg content differs from the recovered serial"
+            )
+
+    current_count = sum(1 for n in nodes if n["current"])
+    obsolete_count = sum(1 for n in nodes if n["obsolete"])
+    kind_counts = Counter(n["kind"] for n in nodes)
+
+    return {
+        "nodes": nodes,
+        "node_count": len(nodes),
+        "current_node_count": current_count,
+        "obsolete_node_count": obsolete_count,
+        "kind_counts": dict(sorted(kind_counts.items())),
+        "all_names": sorted(
+            name.decode("ascii", errors="replace") for name in all_names
+        ),
+        "live_names": sorted(
+            name.decode("ascii", errors="replace") for name in live_entries
+        ),
+        "serial_payload": serial_payload,
+        "serial_value": serial_value,
+        "serial_source": serial_source,
+        "unexpected_names": sorted(
+            name.decode("ascii", errors="replace") for name in unexpected_names
+        ),
+        "live_config_files": live_config_files,
+        "non_ff_bytes": sum(byte != 0xFF for byte in config),
+        "ff_bytes": config.count(0xFF),
+    }
+
+
+def build_minimal_config(serial_payload: bytes) -> bytes:
+    if not serial_payload_is_valid(serial_payload):
+        raise ValidationError("Refusing to build config from an invalid serial payload")
+
+    output = bytearray(b"\xFF" * CONFIG_SIZE)
+
+    # Cleanmarker at the beginning of the first 16 KiB logical eraseblock.
+    clean_header = struct.pack("<HHI", JFFS2_MAGIC, 0x2003, 12)
+    output[0:12] = clean_header + struct.pack("<I", jffs2_crc(clean_header))
+
+    # Root directory entry for serial.cfg. The metadata values reproduce the
+    # known-good vendor recovery layout; only payload length/CRCs are dynamic.
+    name = b"serial.cfg"
+    dirent_offset = 12
+    dirent_total = 40 + len(name)
+    dirent_header = struct.pack("<HHI", JFFS2_MAGIC, 0xE001, dirent_total)
+    dirent_header_crc = struct.pack("<I", jffs2_crc(dirent_header))
+    dirent_fields = struct.pack("<IIII", 1, 123, 7, 1)
+    dirent_fields += struct.pack("<BBH", len(name), 8, 0)
+    dirent_prefix = dirent_header + dirent_header_crc + dirent_fields
+    dirent = (
+        dirent_prefix
+        + struct.pack("<II", jffs2_crc(dirent_prefix), jffs2_crc(name))
+        + name
+    )
+    output[dirent_offset : dirent_offset + len(dirent)] = dirent
+
+    inode_offset = align4(dirent_offset + dirent_total)
+    inode_total = 68 + len(serial_payload)
+    inode_header = struct.pack("<HHI", JFFS2_MAGIC, 0xE002, inode_total)
+    inode_header_crc = struct.pack("<I", jffs2_crc(inode_header))
+    inode_fields = struct.pack(
+        "<IIIHHIIIIIIIBBH",
+        7,                  # inode
+        2,                  # version
+        0x81A4,             # regular file, mode 0644
+        0,                  # uid
+        0,                  # gid
+        len(serial_payload),
+        18,                 # atime
+        18,                 # mtime
+        18,                 # ctime
+        0,                  # file offset
+        len(serial_payload),
+        len(serial_payload),
+        0,                  # no compression
+        0,
+        0,
+    )
+    inode_prefix = inode_header + inode_header_crc + inode_fields
+    inode = (
+        inode_prefix
+        + struct.pack(
+            "<II",
+            jffs2_crc(serial_payload),
+            jffs2_crc(inode_prefix),
+        )
+        + serial_payload
+    )
+    if inode_offset + len(inode) > 0x4000:
+        raise ValidationError("Generated serial.cfg does not fit the first eraseblock")
+    output[inode_offset : inode_offset + len(inode)] = inode
+
+    built = bytes(output)
+    parsed = extract_serial_and_config_info(built)
+    if parsed["serial_payload"] != serial_payload:
+        raise ValidationError("Internal JFFS2 round-trip validation failed")
+    if parsed["current_node_count"] != 3:
+        raise ValidationError(
+            "Internal JFFS2 validation expected exactly three current nodes"
+        )
+    return built
+
+
+def build_preserved_config(files: Iterable[ConfigFile]) -> bytes:
+    files = tuple(sorted(files, key=lambda item: item.name))
+    if not files:
+        raise ValidationError("Preserve-data mode found no live config files")
+    if len({item.name for item in files}) != len(files):
+        raise ValidationError("Preserve-data mode found duplicate file names")
+    serials = [item.data for item in files if item.name == b"serial.cfg"]
+    if len(serials) != 1 or not serial_payload_is_valid(serials[0]):
+        raise ValidationError(
+            "Preserve-data mode requires exactly one valid serial.cfg"
+        )
+
+    output = bytearray(b"\xFF" * CONFIG_SIZE)
+    clean_header = struct.pack("<HHI", JFFS2_MAGIC, 0x2003, 12)
+    output[0:12] = clean_header + struct.pack("<I", jffs2_crc(clean_header))
+    cursor = 12
+
+    for item in files:
+        name = item.name
+        dirent_total = 40 + len(name)
+        dirent_header = struct.pack(
+            "<HHI", JFFS2_MAGIC, 0xE001, dirent_total
+        )
+        dirent_header_crc = struct.pack("<I", jffs2_crc(dirent_header))
+        dirent_fields = struct.pack(
+            "<IIII", 1, 1, item.inode, item.dirent_mctime
+        )
+        dirent_fields += struct.pack("<BBH", len(name), item.dtype, 0)
+        dirent_prefix = dirent_header + dirent_header_crc + dirent_fields
+        dirent = (
+            dirent_prefix
+            + struct.pack(
+                "<II", jffs2_crc(dirent_prefix), jffs2_crc(name)
+            )
+            + name
+        )
+        if cursor + len(dirent) > 0x4000:
+            raise ValidationError(
+                "Preserved config files do not fit the supported compact "
+                "first-eraseblock layout"
+            )
+        output[cursor : cursor + len(dirent)] = dirent
+        cursor = align4(cursor + len(dirent))
+
+        inode_total = 68 + len(item.data)
+        inode_header = struct.pack(
+            "<HHI", JFFS2_MAGIC, 0xE002, inode_total
+        )
+        inode_header_crc = struct.pack("<I", jffs2_crc(inode_header))
+        inode_fields = struct.pack(
+            "<IIIHHIIIIIIIBBH",
+            item.inode,
+            1,
+            item.mode,
+            item.uid,
+            item.gid,
+            len(item.data),
+            item.atime,
+            item.mtime,
+            item.ctime,
+            0,
+            len(item.data),
+            len(item.data),
+            0,
+            0,
+            item.flags,
+        )
+        inode_prefix = inode_header + inode_header_crc + inode_fields
+        inode = (
+            inode_prefix
+            + struct.pack(
+                "<II", jffs2_crc(item.data), jffs2_crc(inode_prefix)
+            )
+            + item.data
+        )
+        if cursor + len(inode) > 0x4000:
+            raise ValidationError(
+                "Preserved config files do not fit the supported compact "
+                "first-eraseblock layout"
+            )
+        output[cursor : cursor + len(inode)] = inode
+        cursor = align4(cursor + len(inode))
+
+    built = bytes(output)
+    parsed = extract_serial_and_config_info(
+        built,
+        allow_unknown_names=True,
+        preserve_live_files=True,
+    )
+    rebuilt_files = parsed["live_config_files"]
+    assert rebuilt_files is not None
+    expected = {
+        item.name: (
+            item.data,
+            item.inode,
+            item.mode,
+            item.uid,
+            item.gid,
+            item.atime,
+            item.mtime,
+            item.ctime,
+            item.flags,
+            item.dirent_mctime,
+            item.dtype,
+        )
+        for item in files
+    }
+    actual = {
+        item.name: (
+            item.data,
+            item.inode,
+            item.mode,
+            item.uid,
+            item.gid,
+            item.atime,
+            item.mtime,
+            item.ctime,
+            item.flags,
+            item.dirent_mctime,
+            item.dtype,
+        )
+        for item in rebuilt_files
+    }
+    if actual != expected:
+        raise ValidationError(
+            "Internal preserve-files JFFS2 round-trip validation failed"
+        )
+    if parsed["obsolete_node_count"] != 0:
+        raise ValidationError(
+            "Internal preserve-files rebuild unexpectedly contains obsolete nodes"
+        )
+    return built
+
+
+def normalized_hwconfig_before_identity(image: bytes) -> bytes:
+    return (
+        image[0x7D0000:HW_RECORD_START + 2]
+        + (0x100).to_bytes(2, "little")
+        + image[HW_RECORD_PAYLOAD_START:HW_CHECK_START]
+    )
+
+
+def normalized_hwconfig_after_unit_fields(
+    image: bytes, record: dict[str, Any]
+) -> bytes:
+    extension_length = record["extension_length"]
+    return (
+        image[HW_DATE_END:HW_KNOWN_PAYLOAD_END]
+        + b"\0" * extension_length
+        + image[record["record_end"]:CONFIG_START]
+    )
+
+
+def invariant_bytes(
+    image: bytes, record: dict[str, Any] | None = None
+) -> bytes:
+    if record is None:
+        _, record = identify_hwconfig_variant(image)
+    return (
+        image[:PATCH_START]
+        + image[PATCH_END:HW_RECORD_START + 2]
+        + (0x100).to_bytes(2, "little")
+        + image[HW_RECORD_PAYLOAD_START:HW_CHECK_START]
+        + image[HW_CHECK_END:HW_UOID_START]
+        + normalized_hwconfig_after_unit_fields(image, record)
+    )
+
+
+def decode_hwconfig_date(image: bytes) -> str:
+    year = int.from_bytes(image[HW_DATE_START:HW_DATE_START + 2], "little")
+    month = image[HW_DATE_START + 2]
+    day = image[HW_DATE_START + 3]
+    try:
+        value = date(year, month, day)
+    except ValueError as exc:
+        raise ValidationError(
+            "The unit-specific HWCONFIG date field is not a valid "
+            f"little-endian year/month/day value ({year:04d}-{month:02d}-{day:02d})"
+        ) from exc
+    if value not in HW_SUPPORTED_DATES:
+        supported = ", ".join(
+            item.isoformat() for item in sorted(HW_SUPPORTED_DATES)
+        )
+        raise ValidationError(
+            "The unit-specific HWCONFIG date field is not one of the physically "
+            f"observed values {supported} (value={value.isoformat()})"
+        )
+    return value.isoformat()
+
+
+def identify_hwconfig_variant(image: bytes) -> tuple[str, dict[str, Any]]:
+    record_type = int.from_bytes(
+        image[HW_RECORD_START:HW_RECORD_START + 2], "little"
+    )
+    record_length = int.from_bytes(
+        image[HW_RECORD_START + 2:HW_RECORD_PAYLOAD_START], "little"
+    )
+    if record_type != 12:
+        raise ValidationError(
+            f"HWCONFIG record has type {record_type}; expected type 12"
+        )
+    if record_length < 0x100:
+        raise ValidationError(
+            "HWCONFIG type-12 payload is shorter than its known 256-byte "
+            f"prefix (payload_length={record_length})"
+        )
+    if record_length not in HW_SUPPORTED_PAYLOAD_LENGTHS:
+        supported = ", ".join(
+            str(length) for length in HW_SUPPORTED_PAYLOAD_LENGTHS
+        )
+        raise ValidationError(
+            "HWCONFIG type-12 payload length is not one of the physically "
+            f"observed lengths {supported} (payload_length={record_length})"
+        )
+    record_end = HW_RECORD_PAYLOAD_START + record_length
+    if record_end > CONFIG_START:
+        raise ValidationError(
+            "HWCONFIG type-12 payload extends beyond the HWCONFIG partition "
+            f"(payload_length={record_length})"
+        )
+
+    extension_length = record_length - 0x100
+    name = f"type12-length{record_length}"
+    return name, {
+        "record_type": record_type,
+        "record_length": record_length,
+        "record_end": record_end,
+        "extension_start": HW_KNOWN_PAYLOAD_END,
+        "extension_length": extension_length,
+        "extension_sha256": sha256(image[HW_KNOWN_PAYLOAD_END:record_end]),
+    }
+
+
+def verify_confirmation_reads(
+    primary: bytes, confirmation_paths: Iterable[Path]
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    primary_hash = sha256(primary)
+
+    for path in confirmation_paths:
+        data, source = read_image_source(path)
+        if len(data) != len(primary):
+            raise ValidationError(
+                f"Confirmation read {path} has {len(data)} bytes; "
+                f"the primary has {len(primary)}"
+            )
+        if data != primary:
+            summary = difference_summary(primary, data)
+            raise ValidationError(
+                f"Confirmation read {path} is not byte-identical to the primary: "
+                f"{summary['different_bytes']} differing bytes, first=0x"
+                f"{summary['first_difference']:06X}, last=0x"
+                f"{summary['last_difference']:06X}"
+            )
+        results.append(
+            {
+                "filename": str(path),
+                "size": len(data),
+                "sha256": primary_hash,
+                "byte_identical": True,
+                "source_format": source["format"],
+                "evidenced_identical_reads": source[
+                    "evidenced_identical_reads"
+                ],
+            }
+        )
+
+    return results
+
+
+def analyze_image(
+    image: bytes,
+    source_name: str = "<memory>",
+    *,
+    allow_unknown_config: bool = False,
+    preserve_config_data: bool = False,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    if len(image) != FLASH_SIZE:
+        raise ValidationError(
+            f"{source_name}: expected exactly {FLASH_SIZE} bytes, got {len(image)}"
+        )
+
+    full_hash = sha256(image)
+
+    try:
+        hwconfig_variant, hwconfig_record = identify_hwconfig_variant(image)
+    except ValidationError as exc:
+        errors.append(str(exc))
+        hwconfig_variant = "unsupported"
+        hwconfig_record = None
+
+    expected_segments = dict(REFERENCE_SEGMENTS)
+
+    segment_results: dict[str, Any] = {}
+    for name, (start, end, expected_hash) in expected_segments.items():
+        actual_hash = sha256(image[start:end])
+        ok = actual_hash == expected_hash
+        segment_results[name] = {
+            "start": start,
+            "end_exclusive": end,
+            "size": end - start,
+            "expected_sha256": expected_hash,
+            "actual_sha256": actual_hash,
+            "match": ok,
+        }
+        if not ok:
+            errors.append(
+                f"{name} 0x{start:06X}-0x{end - 1:06X} does not match "
+                "the supported reference firmware"
+            )
+
+    actual_invariant_hash = "unavailable"
+    if hwconfig_record is not None:
+        normalized_segments = {
+            "hwconfig_before_identity_check": (
+                0x7D0000,
+                HW_CHECK_START,
+                HWCONFIG_BEFORE_IDENTITY_SHA256,
+                normalized_hwconfig_before_identity(image),
+            ),
+            "hwconfig_after_unit_fields": (
+                HW_DATE_END,
+                CONFIG_START,
+                HWCONFIG_AFTER_UNIT_FIELDS_SHA256,
+                normalized_hwconfig_after_unit_fields(image, hwconfig_record),
+            ),
+        }
+        for name, (start, end, expected_hash, normalized_bytes) in (
+            normalized_segments.items()
+        ):
+            actual_hash = sha256(normalized_bytes)
+            ok = actual_hash == expected_hash
+            segment_results[name] = {
+                "start": start,
+                "end_exclusive": end,
+                "size": end - start,
+                "expected_sha256": expected_hash,
+                "actual_sha256": actual_hash,
+                "match": ok,
+                "normalized": True,
+            }
+            if not ok:
+                errors.append(
+                    f"{name} 0x{start:06X}-0x{end - 1:06X} does not match "
+                    "the supported reference firmware after normalizing "
+                    "HWCONFIG unit fields and extension"
+                )
+
+        actual_invariant_hash = sha256(invariant_bytes(image, hwconfig_record))
+        if actual_invariant_hash != NORMALIZED_INVARIANT_SHA256:
+            errors.append(
+                "The combined normalized invariant firmware fingerprint does "
+                "not match the supported reference firmware"
+            )
+
+    patch_region = image[PATCH_START:PATCH_END]
+    patch_hash = sha256(patch_region)
+    if patch_hash == ORIGINAL_PATCH_SHA256:
+        system_state = "stock-unpatched"
+    elif patch_hash == PATCHED_PATCH_SHA256:
+        system_state = "known-bashrc-patched"
+    else:
+        system_state = "unknown"
+        errors.append(
+            "The /home/bashrc.sh SquashFS patch window is neither the exact "
+            "stock version nor the exact audited patched version"
+        )
+
+    uoid = image[HW_UOID_START:HW_UOID_END]
+    if UOID_PATTERN.fullmatch(uoid) is None:
+        errors.append(
+            "The unit-specific HWCONFIG UOID field does not have the expected "
+            "94-byte ASCII structure"
+        )
+
+    check_value = image[HW_CHECK_START:HW_CHECK_END]
+    if check_value in (b"\x00" * 3, b"\xFF" * 3):
+        warnings.append(
+            "The unit-specific three-byte HWCONFIG check value is all-zero/all-FF"
+        )
+
+    try:
+        hwconfig_date = decode_hwconfig_date(image)
+    except ValidationError as exc:
+        errors.append(str(exc))
+        hwconfig_date = "invalid"
+
+    config = image[CONFIG_START:CONFIG_END]
+    try:
+        config_info = extract_serial_and_config_info(
+            config,
+            allow_unknown_names=allow_unknown_config,
+            preserve_live_files=preserve_config_data,
+        )
+    except ValidationError as exc:
+        errors.append(str(exc))
+        config_info = None
+
+    if config_info is not None:
+        if config_info["serial_source"] != "live-current":
+            warnings.append(
+                "serial.cfg was recovered from a unique historical JFFS2 node "
+                "because no valid live serial entry was available"
+            )
+
+    if errors:
+        details = "\n  - ".join(errors)
+        raise ValidationError(
+            f"{source_name} failed strict validation:\n  - {details}"
+        )
+
+    assert config_info is not None
+    canonical_config = build_minimal_config(config_info["serial_payload"])
+
+    return {
+        "source_name": source_name,
+        "size": len(image),
+        "sha256": full_hash,
+        "invariant_sha256": actual_invariant_hash,
+        "invariant_match": True,
+        "hwconfig_variant": hwconfig_variant,
+        "hwconfig_extension_length": hwconfig_record["extension_length"],
+        "hwconfig_extension_sha256": hwconfig_record["extension_sha256"],
+        "segment_results": segment_results,
+        "system_state": system_state,
+        "system_patch_sha256": patch_hash,
+        "hwconfig_check_hex": check_value.hex(),
+        "hwconfig_date": hwconfig_date,
+        "uoid": uoid,
+        "uoid_sha256": sha256(uoid),
+        "serial_payload": config_info["serial_payload"],
+        "serial_value": config_info["serial_value"],
+        "serial_sha256": sha256(config_info["serial_payload"]),
+        "serial_source": config_info["serial_source"],
+        "config_node_count": config_info["node_count"],
+        "config_current_node_count": config_info["current_node_count"],
+        "config_obsolete_node_count": config_info["obsolete_node_count"],
+        "config_kind_counts": config_info["kind_counts"],
+        "config_all_names": config_info["all_names"],
+        "config_live_names": config_info["live_names"],
+        "config_unexpected_names": config_info["unexpected_names"],
+        "live_config_files": config_info["live_config_files"],
+        "config_non_ff_bytes": config_info["non_ff_bytes"],
+        "config_ff_bytes": config_info["ff_bytes"],
+        "config_usage_percent": config_info["non_ff_bytes"] * 100.0 / CONFIG_SIZE,
+        "config_is_canonical": config == canonical_config,
+        "canonical_config_sha256": sha256(canonical_config),
+        "warnings": warnings,
+    }
+
+
+def apply_system_patch(image: bytes, state: str) -> tuple[bytes, bool]:
+    if state == "known-bashrc-patched":
+        return image[PATCH_START:PATCH_END], False
+    if state != "stock-unpatched":
+        raise ValidationError(f"Cannot patch system state {state!r}")
+
+    return build_system_patch_window(image), True
+
+
+def difference_summary(before: bytes, after: bytes) -> dict[str, Any]:
+    if len(before) != len(after):
+        raise ValueError("difference_summary requires equal-size buffers")
+
+    count = 0
+    first: int | None = None
+    last: int | None = None
+    for index, (old, new) in enumerate(zip(before, after)):
+        if old != new:
+            count += 1
+            if first is None:
+                first = index
+            last = index
+
+    return {
+        "different_bytes": count,
+        "first_difference": first,
+        "last_difference": last,
+    }
+
+
+def format_analysis(analysis: dict[str, Any], show_serial: bool = False) -> str:
+    serial_display = (
+        analysis["serial_value"].decode("ascii")
+        if show_serial
+        else mask_value(analysis["serial_value"])
+    )
+    uoid_display = (
+        analysis["uoid"].decode("ascii")
+        if show_serial
+        else mask_value(analysis["uoid"])
+    )
+    segment_lines = []
+    for name, result in analysis["segment_results"].items():
+        normalized = " (normalized)" if result.get("normalized") else ""
+        segment_lines.append(
+            f"  PASS  {name:<34} "
+            f"0x{result['start']:06X}-0x{result['end_exclusive'] - 1:06X}"
+            f"{normalized}"
+        )
+
+    warning_block = ""
+    if analysis["warnings"]:
+        warning_block = "\nWarnings\n--------\n" + "\n".join(
+            f"- {warning}" for warning in analysis["warnings"]
+        ) + "\n"
+
+    return f"""\
+CC2 camera image validation
+===========================
+
+Input
+-----
+Name:                    {analysis['source_name']}
+Size:                    {analysis['size']} bytes
+SHA-256:                 {analysis['sha256']}
+
+Reference match
+---------------
+Invariant fingerprint:   PASS
+Invariant SHA-256:       {analysis['invariant_sha256']}
+HWCONFIG record:         {analysis['hwconfig_variant']}
+HWCONFIG extension:      {analysis['hwconfig_extension_length']} bytes
+Extension SHA-256:       {analysis['hwconfig_extension_sha256']}
+System patch state:      {analysis['system_state']}
+System window SHA-256:   {analysis['system_patch_sha256']}
+
+Invariant segments:
+{chr(10).join(segment_lines)}
+
+Unit-specific data
+------------------
+HWCONFIG check bytes:    {analysis['hwconfig_check_hex']}
+HWCONFIG unit date:      {analysis['hwconfig_date']}
+HWCONFIG UOID:           {uoid_display}
+UOID SHA-256:            {analysis['uoid_sha256']}
+serial.cfg source:       {analysis['serial_source']}
+serial.cfg value:        {serial_display}
+serial.cfg SHA-256:      {analysis['serial_sha256']}
+
+JFFS2 config
+------------
+Physical use:            {analysis['config_usage_percent']:.3f}%
+Non-0xFF bytes:          {analysis['config_non_ff_bytes']}
+CRC-valid nodes:         {analysis['config_node_count']}
+Current nodes:           {analysis['config_current_node_count']}
+Obsolete nodes:          {analysis['config_obsolete_node_count']}
+Names ever observed:     {', '.join(analysis['config_all_names']) or '(none)'}
+Live names:              {', '.join(analysis['config_live_names']) or '(none)'}
+Names outside clean set: {', '.join(analysis['config_unexpected_names']) or '(none)'}
+Already canonical:       {'yes' if analysis['config_is_canonical'] else 'no'}
+Canonical config SHA-256:{analysis['canonical_config_sha256']}
+{warning_block}
+Result: STRICT VALIDATION PASSED
+"""
+
+
+def write_text(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+
+
+def build_recovery(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    confirmation_paths: Iterable[Path],
+    config_mode: str,
+    wipe_unknown_config: bool,
+    show_serial: bool,
+    allow_fewer_reads: bool,
+) -> dict[str, Any]:
+    confirmation_paths = tuple(confirmation_paths)
+    if config_mode not in {"serial-only", "preserve-files"}:
+        raise ValidationError(f"Unknown config mode: {config_mode}")
+    if wipe_unknown_config and config_mode != "serial-only":
+        raise ValidationError(
+            "--wipe-unknown-config is valid only with --config-mode serial-only"
+        )
+    image, input_source = read_image_source(input_path)
+    confirmed_reads = verify_confirmation_reads(image, confirmation_paths)
+    source_name = str(input_path)
+    if input_source["image_member"] is not None:
+        source_name += f"!{input_source['image_member']}"
+    analysis = analyze_image(
+        image,
+        source_name,
+        allow_unknown_config=(
+            wipe_unknown_config or config_mode == "preserve-files"
+        ),
+        preserve_config_data=config_mode == "preserve-files",
+    )
+
+    total_reads = max(
+        input_source["evidenced_identical_reads"],
+        1 + len(confirmed_reads),
+        *(item["evidenced_identical_reads"] for item in confirmed_reads),
+    )
+    insufficient_reads = total_reads < MIN_IDENTICAL_READS
+    if insufficient_reads and not allow_fewer_reads:
+        raise ValidationError(
+            f"Only {total_reads} identical physical read(s) were supplied. "
+            f"Provide {MIN_IDENTICAL_READS} "
+            "total physical reads with --confirm-read, or explicitly accept the "
+            "higher risk with --allow-fewer-reads."
+        )
+
+    output_resolved = output_dir.resolve()
+    protected_inputs = (input_path, *confirmation_paths)
+    for protected in protected_inputs:
+        protected_resolved = protected.resolve()
+        if protected_resolved == output_resolved or protected_resolved.is_relative_to(
+            output_resolved
+        ):
+            raise ValidationError(
+                f"Refusing an output directory that contains input dump {protected}"
+            )
+
+    destination = output_dir
+    with staged_directory(destination) as output_dir:
+        recovery = bytearray(image)
+
+        patched_region, patch_changed = apply_system_patch(
+            image, analysis["system_state"]
+        )
+        recovery[PATCH_START:PATCH_END] = patched_region
+
+        canonical_config = build_minimal_config(analysis["serial_payload"])
+        if config_mode == "preserve-files":
+            live_config_files = analysis["live_config_files"]
+            assert live_config_files is not None
+            rebuilt_config = build_preserved_config(live_config_files)
+            config_changed = image[CONFIG_START:CONFIG_END] != rebuilt_config
+            recovery[CONFIG_START:CONFIG_END] = rebuilt_config
+        else:
+            rebuilt_config = canonical_config
+            config_changed = image[CONFIG_START:CONFIG_END] != rebuilt_config
+            recovery[CONFIG_START:CONFIG_END] = rebuilt_config
+
+        recovery_bytes = bytes(recovery)
+
+        # Prove that no bytes outside the two allowed regions changed.
+        if (
+            recovery_bytes[:PATCH_START] != image[:PATCH_START]
+            or recovery_bytes[PATCH_END:CONFIG_START]
+            != image[PATCH_END:CONFIG_START]
+            or recovery_bytes[CONFIG_END:] != image[CONFIG_END:]
+        ):
+            raise ValidationError("Internal safety check: bytes changed outside allowed regions")
+
+        # Re-run the complete strict validator on the generated image.
+        output_analysis = analyze_image(
+            recovery_bytes,
+            source_name="generated recovery image",
+            allow_unknown_config=config_mode == "preserve-files",
+            preserve_config_data=config_mode == "preserve-files",
+        )
+        if output_analysis["system_state"] != "known-bashrc-patched":
+            raise ValidationError("Generated image is not in the known patched system state")
+        if (
+            config_mode == "serial-only"
+            and not output_analysis["config_is_canonical"]
+        ):
+            raise ValidationError("Generated config is not canonical")
+        if recovery_bytes[CONFIG_START:CONFIG_END] != rebuilt_config:
+            raise ValidationError(
+                "Generated config differs from the selected rebuilt partition"
+            )
+
+        changed_regions: list[dict[str, Any]] = []
+        if patch_changed:
+            changed_regions.append(
+                {
+                    "name": "system_bashrc_patch",
+                    "start": PATCH_START,
+                    "end_inclusive": PATCH_END - 1,
+                    "size": PATCH_SIZE,
+                }
+            )
+        if config_changed:
+            changed_regions.append(
+                {
+                    "name": "config",
+                    "start": CONFIG_START,
+                    "end_inclusive": CONFIG_END - 1,
+                    "size": CONFIG_SIZE,
+                }
+            )
+
+        output_name = "cc2-camera-recovery.bin"
+        layout_name = "cc2-camera-layout.txt"
+        output_path = output_dir / output_name
+        output_path.write_bytes(recovery_bytes)
+        (output_dir / "config-restored.bin").write_bytes(rebuilt_config)
+        (output_dir / "serial.cfg").write_bytes(analysis["serial_payload"])
+
+        layout = """\
+    00000000:00462fff immutable_before_patch
+    00463000:0046afff system_bashrc_patch
+    0046b000:007dffff immutable_after_patch
+    007e0000:007fffff config
+    """
+        write_text(output_dir / layout_name, layout)
+
+        tool_filename = "cc2camera"
+        preserved_files_manifest: list[dict[str, Any]] = []
+        if config_mode == "preserve-files":
+            live_config_files = analysis["live_config_files"]
+            assert live_config_files is not None
+            preserved_files_manifest = [
+                {
+                    "name_hex": item.name.hex(),
+                    "name_display": item.name.decode(
+                        "ascii", errors="backslashreplace"
+                    ),
+                    "size": len(item.data),
+                    "sha256": sha256(item.data),
+                    "inode": item.inode,
+                    "mode": item.mode,
+                    "uid": item.uid,
+                    "gid": item.gid,
+                    "atime": item.atime,
+                    "mtime": item.mtime,
+                    "ctime": item.ctime,
+                    "flags": item.flags,
+                    "dirent_mctime": item.dirent_mctime,
+                    "dirent_type": item.dtype,
+                }
+                for item in live_config_files
+            ]
+        manifest = {
+            "tool": {
+                "name": tool_filename,
+                "version": TOOL_VERSION,
+            },
+            "input": {
+                "filename": input_path.name,
+                "source_format": input_source["format"],
+                "image_member": input_source["image_member"],
+                "size": len(image),
+                "sha256": sha256(image),
+                "acquisition_evidence": {
+                    key: value
+                    for key, value in input_source.items()
+                    if key
+                    not in {
+                        "format",
+                        "image_member",
+                        "size",
+                        "sha256",
+                        "md5",
+                        "evidenced_identical_reads",
+                    }
+                },
+                "confirmed_reads": confirmed_reads,
+                "total_identical_reads": total_reads,
+                "fewer_reads_explicitly_allowed": (
+                    insufficient_reads and allow_fewer_reads
+                ),
+            },
+            "validation": {
+                "invariant_sha256": analysis["invariant_sha256"],
+                "invariant_match": True,
+                "hwconfig_variant": analysis["hwconfig_variant"],
+                "hwconfig_extension_length": analysis[
+                    "hwconfig_extension_length"
+                ],
+                "hwconfig_extension_sha256": analysis[
+                    "hwconfig_extension_sha256"
+                ],
+                "hwconfig_date": analysis["hwconfig_date"],
+                "system_state_before": analysis["system_state"],
+                "system_state_after": output_analysis["system_state"],
+                "serial_source": analysis["serial_source"],
+                "serial_masked": mask_value(analysis["serial_value"]),
+                "serial_sha256": analysis["serial_sha256"],
+                "uoid_masked": mask_value(analysis["uoid"]),
+                "config_usage_percent_before": round(
+                    analysis["config_usage_percent"], 6
+                ),
+                "config_obsolete_nodes_before": analysis[
+                    "config_obsolete_node_count"
+                ],
+                "config_unexpected_names_before": analysis[
+                    "config_unexpected_names"
+                ],
+            },
+            "output": {
+                "filename": output_name,
+                "size": len(recovery_bytes),
+                "sha256": sha256(recovery_bytes),
+                "canonical_config_sha256": sha256(canonical_config),
+                "rebuilt_config_sha256": sha256(rebuilt_config),
+                "preserved_files": preserved_files_manifest,
+            },
+            "changed_regions": changed_regions,
+            "config_mode": config_mode,
+            "wipe_unknown_config": wipe_unknown_config,
+        }
+        write_text(
+            output_dir / "MANIFEST.json",
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        )
+
+        source_report = format_analysis(analysis, show_serial=show_serial)
+        source_report += (
+            f"\nPhysical-read confirmation\n--------------------------\n"
+            f"Byte-identical reads supplied: {total_reads}\n"
+        )
+        for item in confirmed_reads:
+            source_report += f"- {item['filename']}  {item['sha256']}\n"
+        if insufficient_reads:
+            source_report += (
+                "WARNING: fewer than three reads were supplied; the higher risk "
+                "was explicitly accepted.\n"
+            )
+        output_report = format_analysis(output_analysis, show_serial=show_serial)
+        validation_text = (
+            source_report
+            + "\nGenerated image\n===============\n\n"
+            + f"Output SHA-256:         {sha256(recovery_bytes)}\n"
+            + f"System patch changed:   {'yes' if patch_changed else 'no'}\n"
+            + f"Config changed:         {'yes' if config_changed else 'no'}\n"
+            + f"Config mode:            "
+            + config_mode
+            + "\n"
+            + f"Unknown-name wipe:      "
+            + ("yes" if wipe_unknown_config else "no")
+            + "\n"
+            + f"Changed regions:        "
+            + (
+                ", ".join(region["name"] for region in changed_regions)
+                if changed_regions
+                else "(none; input already equals generated image)"
+            )
+            + "\n\nPost-build validation\n---------------------\n"
+            + output_report
+        )
+        write_text(output_dir / "VALIDATION.txt", validation_text)
+
+        selected = " ".join(
+            f"-i {region['name']}" for region in changed_regions
+        )
+        if changed_regions:
+            write_command = (
+                "flashrom "
+                "-p buspirate_spi:dev=COM11,spispeed=1M "
+                f"-l {layout_name} {selected} -w {output_name}"
+            )
+            write_section = f"""\
+    WRITE COMMAND TEMPLATE
+    ----------------------
+    Edit COM11 and speed settings for your programmer, then run from this folder:
+
+    {write_command}
+
+    The command intentionally omits --progress because some flashrom versions
+    spam progress-accounting warnings. Flashrom still performs verification.
+
+    The command intentionally does not enable programmer-supplied power. Verify
+    the flash chip's required voltage and your wiring first, then power it using
+    the hardware method you have independently tested while reading.
+    """
+        else:
+            write_section = """\
+    WRITE COMMAND
+    -------------
+    No write is necessary: the input already equals the generated recovery image.
+    """
+
+        read_warning = ""
+        if insufficient_reads:
+            read_warning = """\
+    READ-CONFIDENCE WARNING
+    -----------------------
+    This image was built from fewer than three byte-identical physical reads.
+    Re-read the flash and rebuild before writing if at all possible.
+
+    """
+
+        flashing = f"""\
+    CC2 CAMERA RECOVERY — GENERATED INSTRUCTIONS
+    ============================================
+
+    Input SHA-256:
+    {sha256(image)}
+
+    Recovery SHA-256:
+    {sha256(recovery_bytes)}
+
+    {read_warning}
+    {write_section}
+    FULL READBACK
+    -------------
+    Keep the same stable programmer connection and make a complete 8 MiB read:
+
+    flashrom -p buspirate_spi:dev=COM11,spispeed=1M -r cc2-camera-readback.bin
+
+    Then compare every byte:
+
+    fc.exe /b {output_name} cc2-camera-readback.bin\n\nOn Linux/macOS use: cmp {output_name} cc2-camera-readback.bin
+
+    Never connect normal USB/device power and programmer-supplied target power at
+    the same time. Confirm the SPI voltage from the exact flash part marking or
+    datasheet before making any powered connection.
+
+    PRIVACY
+    -------
+    serial.cfg and the generated recovery image contain this camera's unique
+    identifier. Do not publish either file unredacted.
+    """
+        write_text(output_dir / "FLASHING.txt", flashing)
+
+        hashes = []
+        for name in [
+            output_name,
+            "config-restored.bin",
+            "serial.cfg",
+            layout_name,
+            "MANIFEST.json",
+            "VALIDATION.txt",
+            "FLASHING.txt",
+        ]:
+            content = (output_dir / name).read_bytes()
+            hashes.append(f"{sha256(content)}  {name}")
+        write_text(output_dir / "SHA256SUMS.txt", "\n".join(hashes) + "\n")
+
+        return {
+            "analysis": analysis,
+            "output_analysis": output_analysis,
+            "manifest": manifest,
+            "confirmed_reads": confirmed_reads,
+            "output_dir": destination,
+            "output_path": destination / output_name,
+        }
+
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    path = Path(args.image)
+    image, source = read_image_source(path)
+    confirmations = verify_confirmation_reads(
+        image, [Path(item) for item in args.confirm_read]
+    )
+    source_name = str(path)
+    if source["image_member"] is not None:
+        source_name += f"!{source['image_member']}"
+    print(format_analysis(analyze_image(image, source_name), show_serial=args.show_identifiers))
+    evidenced_reads = max(
+        source["evidenced_identical_reads"],
+        1 + len(confirmations),
+        *(item["evidenced_identical_reads"] for item in confirmations),
+    )
+    print(f"Byte-identical physical reads evidenced: {evidenced_reads}")
+    if source["format"] == USB_BACKUP_FORMAT:
+        print(
+            "  USB backup: "
+            f"{source['consecutive_identical_reads']} consecutive identical "
+            f"reads in {source['read_passes']} attempt(s)"
+        )
+    for item in confirmations:
+        print(f"  {item['filename']}  {item['sha256']}")
+
+
+def cmd_build(args: argparse.Namespace) -> None:
+    input_path = Path(args.image)
+    output_dir = (
+        Path(args.output)
+        if args.output
+        else input_path.with_name(f"{input_path.stem}-cc2-recovery")
+    )
+    result = build_recovery(
+        input_path,
+        output_dir,
+        confirmation_paths=[Path(item) for item in args.confirm_read],
+        config_mode=args.config_mode,
+        wipe_unknown_config=args.wipe_unknown_config,
+        show_serial=args.show_identifiers,
+        allow_fewer_reads=args.allow_fewer_reads,
+    )
+    manifest = result["manifest"]
+    print("RECOVERY BUILD PASSED")
+    print(f"Output directory: {result['output_dir']}")
+    print(f"Recovery image:   {result['output_path']}")
+    print(f"SHA-256:          {manifest['output']['sha256']}")
+    print(
+        f"Identical reads:  {manifest['input']['total_identical_reads']}"
+    )
+    print(f"Config mode:      {manifest['config_mode']}")
+    if manifest["changed_regions"]:
+        print(
+            "Regions to write: "
+            + ", ".join(region["name"] for region in manifest["changed_regions"])
+        )
+    else:
+        print("Regions to write: none")
+    if manifest["input"]["source_format"] == USB_BACKUP_FORMAT:
+        print("Next, restore the recovery image:")
+        print(invocation("restore", str(result["output_path"]), "--backup", str(input_path)))
+    else:
+        print("Next, program the generated full image with your external programmer and require full-chip verification.")
